@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -yq \
             git curl make fakeroot dpkg-dev \
-            libtinfo6 clang lld zstd \
+            libtinfo6 clang lld \
             libplist-utils
 
       # ── Theos setup ─────────────────────────────────────────────────────
@@ -43,19 +43,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/theos/sdks
-          key: sdks-iPhoneOS16.5
+          key: sdks-iPhoneOS16.5-master-146e41f
 
       - name: Download iOS 16.5 SDK
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           mkdir -p /opt/theos/sdks
           curl -fsSL \
-            "https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.zst" \
-            -o /tmp/sdk.tar.zst
-          file /tmp/sdk.tar.zst
-          zstd -d /tmp/sdk.tar.zst -o /tmp/sdk.tar
-          tar -xf /tmp/sdk.tar -C /opt/theos/sdks
-          rm /tmp/sdk.tar.zst /tmp/sdk.tar
+            "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz" \
+            -o /tmp/sdk.tar.xz
+          tar -xJf /tmp/sdk.tar.xz -C /opt/theos/sdks
+          rm /tmp/sdk.tar.xz
 
       # ── ldid (code-signing tool required by Theos) ───────────────────────
       - name: Cache ldid
