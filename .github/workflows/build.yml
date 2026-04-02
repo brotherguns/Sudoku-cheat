@@ -23,6 +23,14 @@ jobs:
             git curl make fakeroot dpkg-dev \
             libtinfo6 clang lld lzma \
             libplist-utils
+          # libtinfo5 was dropped from Ubuntu 24.04 (noble) but the sbingner
+          # LLVM-10 toolchain requires the versioned symbol NCURSES_TINFO_5.0.19991023
+          # which libtinfo.so.6 does NOT export — a bare symlink won't fix it.
+          # Pull the real libtinfo5 .deb from the Ubuntu 22.04 (jammy) archive.
+          curl -fsSL \
+            "http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.3-2_amd64.deb" \
+            -o /tmp/libtinfo5.deb
+          sudo dpkg -i /tmp/libtinfo5.deb
 
       # ── Theos setup ─────────────────────────────────────────────────────
       - name: Cache Theos
@@ -56,15 +64,6 @@ jobs:
           mkdir -p /opt/theos/toolchain/linux/iphone
           mv "$TMP"/ios-arm64e-clang-toolchain/* /opt/theos/toolchain/linux/iphone/
           rm -rf /tmp/toolchain.tar.lzma "$TMP"
-
-      # libtinfo.so.5 shim — Ubuntu 24.04 only ships v6
-      - name: Symlink libtinfo.so.5
-        run: |
-          if [ ! -f /lib/x86_64-linux-gnu/libtinfo.so.5 ]; then
-            sudo ln -s /lib/x86_64-linux-gnu/libtinfo.so.6 \
-                       /lib/x86_64-linux-gnu/libtinfo.so.5
-          fi
-
 
       # ── iOS SDK ─────────────────────────────────────────────────────────
       - name: Cache iOS SDK
