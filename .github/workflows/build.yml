@@ -1,0 +1,89 @@
+name: Build SudokuSolver Tweak
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Theos dependencies ──────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq \
+            git curl make fakeroot dpkg-dev \
+            libtinfo5 libz3-dev clang lld \
+            libplist-utils
+
+      # ── Theos setup ─────────────────────────────────────────────────────
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: /opt/theos
+          key: theos-${{ runner.os }}-${{ hashFiles('.github/workflows/build.yml') }}
+
+      - name: Install Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          git clone --recursive https://github.com/theos/theos.git /opt/theos
+
+      # ── iOS SDK ─────────────────────────────────────────────────────────
+      - name: Cache iOS SDK
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: /opt/theos/sdks
+          key: sdks-iPhoneOS16.5
+
+      - name: Download iOS 16.5 SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /opt/theos/sdks
+          curl -L \
+            "https://github.com/theos/sdks/releases/download/2024-08-09/iPhoneOS16.5.sdk.tar.zst" \
+            -o /tmp/sdk.tar.zst
+          tar --use-compress-program=unzstd \
+            -xf /tmp/sdk.tar.zst \
+            -C /opt/theos/sdks
+
+      # ── ldid (code-signing tool required by Theos) ───────────────────────
+      - name: Cache ldid
+        id: cache-ldid
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/ldid
+          key: ldid-v2.1.5-linux
+
+      - name: Install ldid
+        if: steps.cache-ldid.outputs.cache-hit != 'true'
+        run: |
+          curl -L \
+            "https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64" \
+            -o /usr/local/bin/ldid
+          chmod +x /usr/local/bin/ldid
+
+      # ── Build ────────────────────────────────────────────────────────────
+      - name: Build .deb package
+        env:
+          THEOS: /opt/theos
+        run: |
+          cd SudokuSolver   # adjust if your tweak folder is at repo root
+          make package FINALPACKAGE=1
+
+      # ── Upload artifact ──────────────────────────────────────────────────
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: SudokuSolver-deb
+          path: SudokuSolver/packages/*.deb   # adjust path to match above
+          if-no-files-found: error
