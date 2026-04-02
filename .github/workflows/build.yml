@@ -1,107 +1,75 @@
-name: Build SudokuSolver Tweak
+name: Build VLCrawler Dylib
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Theos dependencies ──────────────────────────────────────────────
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -yq \
-            git curl make fakeroot dpkg-dev \
-            clang lld xz-utils \
-            libplist-utils
-
-      # ── Theos setup ─────────────────────────────────────────────────────
       - name: Cache Theos
-        id: cache-theos
+        id: theos-cache
         uses: actions/cache@v4
         with:
-          path: /opt/theos
+          path: ${{ github.workspace }}/theos
           key: theos-${{ runner.os }}-${{ hashFiles('.github/workflows/build.yml') }}
 
+      - name: Install dependencies
+        run: brew install ldid dpkg
+
       - name: Install Theos
-        if: steps.cache-theos.outputs.cache-hit != 'true'
-        run: |
-          git clone --recursive https://github.com/theos/theos.git /opt/theos
-
-      # ── iOS cross-compilation toolchain ─────────────────────────────────
-      # kabiroberai's toolchain ships clang 14+ and correctly parses iOS 16.x
-      # SDK headers (NS_SWIFT_SENDABLE, _Nullable_result, etc.) that the old
-      # sbingner LLVM-10 toolchain cannot handle. No libtinfo5 shim needed.
-      - name: Cache toolchain
-        id: cache-toolchain
-        uses: actions/cache@v4
-        with:
-          path: /opt/theos/toolchain/linux/iphone
-          key: theos-toolchain-kabiroberai-latest
-
-      - name: Install iOS toolchain
-        if: steps.cache-toolchain.outputs.cache-hit != 'true'
-        run: |
-          curl -fsSL \
-            "            "https://github.com/kabiroberai/theos-tree/releases/latest/download/toolchain-linux.tar.xz" \" \
-            -o /tmp/toolchain.tar.xz
-          mkdir -p /opt/theos/toolchain/linux/iphone
-          tar -xJf /tmp/toolchain.tar.xz -C /opt/theos/toolchain/linux/iphone --strip-components=1
-          rm /tmp/toolchain.tar.xz
-
-      # ── iOS SDK ─────────────────────────────────────────────────────────
-      - name: Cache iOS SDK
-        id: cache-sdk
-        uses: actions/cache@v4
-        with:
-          path: /opt/theos/sdks
-          key: sdks-iPhoneOS16.5-master-146e41f
-
-      - name: Download iOS 16.5 SDK
-        if: steps.cache-sdk.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p /opt/theos/sdks
-          curl -fsSL \
-            "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz" \
-            -o /tmp/sdk.tar.xz
-          tar -xJf /tmp/sdk.tar.xz -C /opt/theos/sdks
-          rm /tmp/sdk.tar.xz
-
-      # ── ldid (code-signing tool required by Theos) ───────────────────────
-      - name: Cache ldid
-        id: cache-ldid
-        uses: actions/cache@v4
-        with:
-          path: /usr/local/bin/ldid
-          key: ldid-v2.1.5-linux
-
-      - name: Install ldid
-        if: steps.cache-ldid.outputs.cache-hit != 'true'
-        run: |
-          curl -L \
-            "https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64" \
-            -o /usr/local/bin/ldid
-          chmod +x /usr/local/bin/ldid
-
-      # ── Build ────────────────────────────────────────────────────────────
-      - name: Build .deb package
+        if: steps.theos-cache.outputs.cache-hit != 'true'
+        run: git clone --recursive https://github.com/theos/theos.git $THEOS
         env:
-          THEOS: /opt/theos
-        run: make package FINALPACKAGE=1
+          THEOS: ${{ github.workspace }}/theos
 
-      # ── Upload artifact ──────────────────────────────────────────────────
-      - name: Upload .deb
+      - name: Set up iOS SDK
+        run: |
+          XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          SDK_VERSION=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "Using Xcode SDK: $XCODE_SDK (iOS $SDK_VERSION)"
+          mkdir -p $THEOS/sdks
+          ln -sfn "$XCODE_SDK" "$THEOS/sdks/iPhoneOS${SDK_VERSION}.sdk"
+          echo "SDK_VERSION=$SDK_VERSION" >> $GITHUB_ENV
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Build
+        run: |
+          make clean
+          make package FINALPACKAGE=1
+        env:
+          THEOS: ${{ github.workspace }}/theos
+          THEOS_DEVICE_IP: ""
+          SDKVERSION: ${{ env.SDK_VERSION }}
+
+      - name: Extract dylib from deb
+        run: |
+          DEB=$(ls packages/*.deb | head -1)
+          echo "Built: $DEB"
+          mkdir -p artifacts
+          dpkg-deb -x "$DEB" artifacts/extracted/
+          cp artifacts/extracted/Library/MobileSubstrate/DynamicLibraries/VLCrawler.dylib artifacts/
+          cp "$DEB" artifacts/
+
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: SudokuSolver-deb
-          path: packages/*.deb
-          if-no-files-found: error
+          name: VLCrawler-dylib
+          path: artifacts/VLCrawler.dylib
+          retention-days: 30
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: VLCrawler-deb
+          path: artifacts/*.deb
+          retention-days: 30
