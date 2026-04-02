@@ -1,75 +1,37 @@
-name: Build VLCrawler Dylib
+name: Build Tweak
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
-
+    env:
+      THEOS: ${{ github.workspace }}/theos
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache Theos
-        id: theos-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/theos
-          key: theos-${{ runner.os }}-${{ hashFiles('.github/workflows/build.yml') }}
-
-      - name: Install dependencies
-        run: brew install ldid dpkg
-
-      - name: Install Theos
-        if: steps.theos-cache.outputs.cache-hit != 'true'
-        run: git clone --recursive https://github.com/theos/theos.git $THEOS
-        env:
-          THEOS: ${{ github.workspace }}/theos
-
-      - name: Set up iOS SDK
+      - name: Setup Theos
         run: |
-          XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          SDK_VERSION=$(xcrun --sdk iphoneos --show-sdk-version)
-          echo "Using Xcode SDK: $XCODE_SDK (iOS $SDK_VERSION)"
-          mkdir -p $THEOS/sdks
-          ln -sfn "$XCODE_SDK" "$THEOS/sdks/iPhoneOS${SDK_VERSION}.sdk"
-          echo "SDK_VERSION=$SDK_VERSION" >> $GITHUB_ENV
-        env:
-          THEOS: ${{ github.workspace }}/theos
+          set -e
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          curl -fsSL https://github.com/theos/sdks/archive/master.tar.gz | tar xz -C $THEOS/sdks --strip-components=1
 
-      - name: Build
+      - name: Build (rootless)
+        run: make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Build (rootful)
         run: |
           make clean
           make package FINALPACKAGE=1
-        env:
-          THEOS: ${{ github.workspace }}/theos
-          THEOS_DEVICE_IP: ""
-          SDKVERSION: ${{ env.SDK_VERSION }}
 
-      - name: Extract dylib from deb
-        run: |
-          DEB=$(ls packages/*.deb | head -1)
-          echo "Built: $DEB"
-          mkdir -p artifacts
-          dpkg-deb -x "$DEB" artifacts/extracted/
-          cp artifacts/extracted/Library/MobileSubstrate/DynamicLibraries/VLCrawler.dylib artifacts/
-          cp "$DEB" artifacts/
-
-      - name: Upload dylib
+      - name: Upload debs
         uses: actions/upload-artifact@v4
         with:
-          name: VLCrawler-dylib
-          path: artifacts/VLCrawler.dylib
-          retention-days: 30
-
-      - name: Upload deb
-        uses: actions/upload-artifact@v4
-        with:
-          name: VLCrawler-deb
-          path: artifacts/*.deb
-          retention-days: 30
+          name: SudokuSolver
+          path: packages/*.deb
