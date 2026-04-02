@@ -73,6 +73,12 @@ IL2CPP_API_LIST
 #pragma mark - State
 
 static BOOL       gIL2CPPReady    = NO;   // il2cpp exports resolved
+
+// Forward declarations
+static BOOL resolveIL2CPP(void);
+static BOOL resolveMethods(void);
+static void installInvokeHook(void);
+static NSString *findDB(void);
 static BOOL       gBoardReady     = NO;   // have an active board instance
 static void      *gCellsInstance  = NULL;  // BoardModelCells*
 static int        gBoardSize      = 81;    // 9×9 default
