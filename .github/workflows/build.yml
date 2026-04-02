@@ -52,7 +52,7 @@ jobs:
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
         run: |
           curl -fsSL \
-            "https://github.com/kabiroberai/theos-tree/releases/latest/download/toolchain-linux.tar.xz" \
+            "            "https://github.com/kabiroberai/theos-tree/releases/latest/download/toolchain-linux.tar.xz" \" \
             -o /tmp/toolchain.tar.xz
           mkdir -p /opt/theos/toolchain/linux/iphone
           tar -xJf /tmp/toolchain.tar.xz -C /opt/theos/toolchain/linux/iphone --strip-components=1
