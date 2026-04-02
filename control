@@ -1,0 +1,9 @@
+Package: com.ntroherb.sudokusolver
+Name: SudokuSolver
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Auto-solver + memory dumper for Easybrain Sudoku.com
+Maintainer: ntroherb
+Author: ntroherb
+Section: Tweaks
+Depends: mobilesubstrate
