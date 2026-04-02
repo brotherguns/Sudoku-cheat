@@ -21,16 +21,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -yq \
             git curl make fakeroot dpkg-dev \
-            libtinfo6 clang lld lzma \
+            clang lld xz-utils \
             libplist-utils
-          # libtinfo5 was dropped from Ubuntu 24.04 (noble) but the sbingner
-          # LLVM-10 toolchain requires the versioned symbol NCURSES_TINFO_5.0.19991023
-          # which libtinfo.so.6 does NOT export — a bare symlink won't fix it.
-          # Pull the real libtinfo5 .deb from the Ubuntu 22.04 (jammy) archive.
-          curl -fsSL \
-            "http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.3-2_amd64.deb" \
-            -o /tmp/libtinfo5.deb
-          sudo dpkg -i /tmp/libtinfo5.deb
 
       # ── Theos setup ─────────────────────────────────────────────────────
       - name: Cache Theos
@@ -46,24 +38,25 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git /opt/theos
 
       # ── iOS cross-compilation toolchain ─────────────────────────────────
+      # kabiroberai's toolchain ships clang 14+ and correctly parses iOS 16.x
+      # SDK headers (NS_SWIFT_SENDABLE, _Nullable_result, etc.) that the old
+      # sbingner LLVM-10 toolchain cannot handle. No libtinfo5 shim needed.
       - name: Cache toolchain
         id: cache-toolchain
         uses: actions/cache@v4
         with:
           path: /opt/theos/toolchain/linux/iphone
-          key: theos-toolchain-sbingner-latest
+          key: theos-toolchain-kabiroberai-latest
 
       - name: Install iOS toolchain
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
         run: |
           curl -fsSL \
-            "https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma" \
-            -o /tmp/toolchain.tar.lzma
-          TMP=$(mktemp -d)
-          tar --lzma -xf /tmp/toolchain.tar.lzma -C "$TMP"
+            "https://github.com/kabiroberai/theos-tree/releases/latest/download/toolchain-linux.tar.xz" \
+            -o /tmp/toolchain.tar.xz
           mkdir -p /opt/theos/toolchain/linux/iphone
-          mv "$TMP"/ios-arm64e-clang-toolchain/* /opt/theos/toolchain/linux/iphone/
-          rm -rf /tmp/toolchain.tar.lzma "$TMP"
+          tar -xJf /tmp/toolchain.tar.xz -C /opt/theos/toolchain/linux/iphone --strip-components=1
+          rm /tmp/toolchain.tar.xz
 
       # ── iOS SDK ─────────────────────────────────────────────────────────
       - name: Cache iOS SDK
