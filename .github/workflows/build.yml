@@ -16,11 +16,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install dependencies
+        run: brew install ldid dpkg make xz
+
       - name: Setup Theos
         run: |
           set -e
-          git clone --recursive https://github.com/theos/theos.git $THEOS
-          curl -fsSL https://github.com/theos/sdks/archive/master.tar.gz | tar xz -C $THEOS/sdks --strip-components=1
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          curl -fsSL https://github.com/theos/sdks/archive/master.tar.gz \
+            | tar xz -C $THEOS/sdks --strip-components=1
 
       - name: Build (rootless)
         run: make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
