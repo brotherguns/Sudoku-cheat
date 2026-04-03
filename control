@@ -1,6 +1,6 @@
 Package: com.brotherguns.sudokusolver
 Name: SudokuSolver
-Version: 1.1.0
+Version: 1.3.0
 Architecture: iphoneos-arm64
 Description: Auto-solve tweak for Easybrain Sudoku
 Maintainer: brotherguns
