@@ -1,277 +1,279 @@
 /*
- * SudokuSolver — Auto-solve tweak for Easybrain Sudoku (iOS)
- * Bundle: com.easybrain.sudoku
- * Engine: Unity IL2CPP arm64, metadata v31
+ * SudokuSolver — Auto-solve for Easybrain Sudoku (com.easybrain.sudoku)
  *
- * == How it works ==
- *
- * PRIMARY (live solve via IL2CPP runtime API):
- *   • On load, resolve il2cpp_* exports from UnityFramework via dlsym
- *   • Hook BoardModelCells.Init() to capture the active cells model
- *   • On solve: loop every cell, call GetCellAnswer() → SetCell()
- *
- * FALLBACK (DB patch — requires level restart):
- *   • Read the `solution` column from the SudokuGame sqlite table
- *   • Overwrite the `cells` column so the game loads a solved board
- *
- * == Key classes (from metadata dump) ==
- *
- *   BoardModelCells (Sudoku.Game.Mechanics.Base)
- *     Fields: Model, UndoManager, OnCellChanged, OnCellStateChanged, LevelData, Config
- *     Key methods:
- *       Init()                     — we hook this to grab the instance
- *       GetCellAnswer(int)         — returns correct digit for flat index
- *       SetCell(int, int)          — sets cell at flat index to digit
- *       IsCellMutable(int)         — true if not a preset constant
- *       GetCellState(int)          — Empty=0, Error=1, Ok=2, Constant=3
- *       IsAllCellsFull()           — true when board is complete
- *       CountEmptyCells()          — remaining empty cell count
- *
- *   LevelSaveConfig (Sudoku.Scripts.Game.Mechanics.Base.Data.Serialize)
- *     Fields: Mode, Difficulty, LevelId, CellsData, Height, Width, MaxNumber ...
- *
- *   CellState enum: Empty=0  Error=1  Ok=2  Constant=3  Unavailable=4
- *
- *   SudokuGame sqlite table:
- *     cells, solution, state, mistakesCount, ...
+ * v1: Safe for dylib injection. Only hooks UIWindow for the button.
+ *     All IL2CPP + SQLite work happens on-demand when the user taps solve.
+ *     Nothing runs at startup that could crash the app.
  */
 
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <sqlite3.h>
-#import <objc/runtime.h>
 #import <substrate.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach/mach.h>
+#import <sys/stat.h>
 
-#pragma mark - IL2CPP API types
+// ================================================================
+#pragma mark - IL2CPP types & function pointers
+// ================================================================
 
-typedef void Il2CppDomain;
-typedef void Il2CppAssembly;
-typedef void Il2CppImage;
-typedef void Il2CppClass;
-typedef void Il2CppObject;
-typedef void Il2CppMethodInfo;
+typedef void  Il2CppDomain;
+typedef void  Il2CppAssembly;
+typedef void  Il2CppImage;
+typedef void  Il2CppClass;
+typedef void  Il2CppObject;
+typedef void  Il2CppMethodInfo;
 
-// Function pointer types for every il2cpp export we need
-#define IL2CPP_API_LIST \
-    X(Il2CppDomain*,      il2cpp_domain_get,                    (void)) \
-    X(Il2CppAssembly**,   il2cpp_domain_get_assemblies,         (Il2CppDomain*, size_t*)) \
-    X(Il2CppImage*,       il2cpp_assembly_get_image,            (Il2CppAssembly*)) \
-    X(const char*,        il2cpp_image_get_name,                (Il2CppImage*)) \
-    X(Il2CppClass*,       il2cpp_class_from_name,               (Il2CppImage*, const char*, const char*)) \
-    X(const Il2CppMethodInfo*, il2cpp_class_get_method_from_name, (Il2CppClass*, const char*, int)) \
-    X(Il2CppObject*,      il2cpp_runtime_invoke,                (const Il2CppMethodInfo*, void*, void**, Il2CppObject**)) \
-    X(const char*,        il2cpp_class_get_name,                (Il2CppClass*)) \
-    X(Il2CppClass*,       il2cpp_object_get_class,              (Il2CppObject*)) \
-    X(int,                il2cpp_class_get_type_token,           (Il2CppClass*)) \
-    X(void*,              il2cpp_object_unbox,                   (Il2CppObject*))
+static Il2CppDomain*       (*api_domain_get)(void);
+static Il2CppAssembly**    (*api_domain_get_assemblies)(Il2CppDomain*, size_t*);
+static Il2CppImage*        (*api_assembly_get_image)(Il2CppAssembly*);
+static const char*         (*api_image_get_name)(Il2CppImage*);
+static Il2CppClass*        (*api_class_from_name)(Il2CppImage*, const char*, const char*);
+static const Il2CppMethodInfo* (*api_class_get_methods)(Il2CppClass*, void**);
+static const Il2CppMethodInfo* (*api_class_get_method_from_name)(Il2CppClass*, const char*, int);
+static Il2CppObject*       (*api_runtime_invoke)(const Il2CppMethodInfo*, void*, void**, Il2CppObject**);
+static const char*         (*api_method_get_name)(const Il2CppMethodInfo*);
+static void*               (*api_object_unbox)(Il2CppObject*);
 
-// Declare function pointers
-#define X(ret, name, args) static ret (*name##_ptr) args = NULL;
-IL2CPP_API_LIST
-#undef X
+static BOOL gIL2CPPResolved = NO;
 
-#pragma mark - State
+// ================================================================
+#pragma mark - Instance capture state
+// ================================================================
 
-static BOOL       gIL2CPPReady    = NO;   // il2cpp exports resolved
+static void *gCellsInstance = NULL;   // BoardModelCells this-ptr
+static BOOL  gHooked        = NO;     // did we install the targeted hook?
 
-// Forward declarations
-static BOOL resolveIL2CPP(void);
-static BOOL resolveMethods(void);
-static void installInvokeHook(void);
-static NSString *findDB(void);
-static BOOL       gBoardReady     = NO;   // have an active board instance
-static void      *gCellsInstance  = NULL;  // BoardModelCells*
-static int        gBoardSize      = 81;    // 9×9 default
-
-// Method pointers cached after first resolve
 static const Il2CppMethodInfo *mGetCellAnswer = NULL;
 static const Il2CppMethodInfo *mSetCell       = NULL;
 static const Il2CppMethodInfo *mIsCellMutable = NULL;
 static const Il2CppMethodInfo *mGetCellState  = NULL;
 static const Il2CppMethodInfo *mCountEmpty    = NULL;
-static const Il2CppMethodInfo *mIsAllFull     = NULL;
 
-static NSString *gDBPath    = nil;
-static UIButton *gSolveBtn  = nil;
-static BOOL      gBtnAdded  = NO;
+// ================================================================
+#pragma mark - IL2CPP resolve (lazy, on first solve tap)
+// ================================================================
 
-#pragma mark - IL2CPP bootstrap
+static BOOL resolveAPI(void) {
+    if (gIL2CPPResolved) return YES;
 
-static BOOL resolveIL2CPP(void) {
-    if (gIL2CPPReady) return YES;
+    // These symbols live in UnityFramework which is loaded by now
+    #define R(name, sym) name = dlsym(RTLD_DEFAULT, #sym)
+    R(api_domain_get,                il2cpp_domain_get);
+    R(api_domain_get_assemblies,     il2cpp_domain_get_assemblies);
+    R(api_assembly_get_image,        il2cpp_assembly_get_image);
+    R(api_image_get_name,            il2cpp_image_get_name);
+    R(api_class_from_name,           il2cpp_class_from_name);
+    R(api_class_get_methods,         il2cpp_class_get_methods);
+    R(api_class_get_method_from_name,il2cpp_class_get_method_from_name);
+    R(api_runtime_invoke,            il2cpp_runtime_invoke);
+    R(api_method_get_name,           il2cpp_method_get_name);
+    R(api_object_unbox,              il2cpp_object_unbox);
+    #undef R
 
-    #define X(ret, name, args) \
-        name##_ptr = (ret(*) args)dlsym(RTLD_DEFAULT, #name); \
-        if (!name##_ptr) { NSLog(@"[SS] missing: %s", #name); }
-    IL2CPP_API_LIST
-    #undef X
+    gIL2CPPResolved = api_domain_get
+                   && api_class_from_name
+                   && api_class_get_method_from_name
+                   && api_runtime_invoke
+                   && api_object_unbox;
 
-    gIL2CPPReady = (il2cpp_domain_get_ptr &&
-                    il2cpp_class_from_name_ptr &&
-                    il2cpp_class_get_method_from_name_ptr &&
-                    il2cpp_runtime_invoke_ptr);
-
-    NSLog(@"[SS] il2cpp resolved: %d", gIL2CPPReady);
-    return gIL2CPPReady;
+    NSLog(@"[SS] il2cpp API resolved: %d", gIL2CPPResolved);
+    return gIL2CPPResolved;
 }
 
 static Il2CppImage *findGameImage(void) {
-    if (!gIL2CPPReady) return NULL;
-
-    Il2CppDomain *dom = il2cpp_domain_get_ptr();
+    Il2CppDomain *dom = api_domain_get();
     if (!dom) return NULL;
-
     size_t cnt = 0;
-    Il2CppAssembly **asms = il2cpp_domain_get_assemblies_ptr(dom, &cnt);
-
+    Il2CppAssembly **asms = api_domain_get_assemblies(dom, &cnt);
     for (size_t i = 0; i < cnt; i++) {
-        Il2CppImage *img = il2cpp_assembly_get_image_ptr(asms[i]);
+        Il2CppImage *img = api_assembly_get_image(asms[i]);
         if (!img) continue;
-        // Try resolving BoardModelCells directly
-        Il2CppClass *k = il2cpp_class_from_name_ptr(img,
-                            "Sudoku.Game.Mechanics.Base", "BoardModelCells");
-        if (k) return img;
+        if (api_class_from_name(img, "Sudoku.Game.Mechanics.Base", "BoardModelCells"))
+            return img;
     }
     return NULL;
 }
 
 static BOOL resolveMethods(void) {
     if (mGetCellAnswer) return YES;
-
     Il2CppImage *img = findGameImage();
-    if (!img) { NSLog(@"[SS] game image not found"); return NO; }
+    if (!img) return NO;
 
-    Il2CppClass *cells = il2cpp_class_from_name_ptr(img,
-                            "Sudoku.Game.Mechanics.Base", "BoardModelCells");
-    if (!cells) { NSLog(@"[SS] BoardModelCells not found"); return NO; }
+    Il2CppClass *cls = api_class_from_name(img,
+                        "Sudoku.Game.Mechanics.Base", "BoardModelCells");
+    if (!cls) return NO;
 
-    // GetCellAnswer has overloads (1-arg flat index, 2-arg row/col, 3-arg?)
-    // SetCell same. We want the single-int-arg versions.
-    mGetCellAnswer = il2cpp_class_get_method_from_name_ptr(cells, "GetCellAnswer", 1);
-    mSetCell       = il2cpp_class_get_method_from_name_ptr(cells, "SetCell", 2);
-    mIsCellMutable = il2cpp_class_get_method_from_name_ptr(cells, "IsCellMutable", 1);
-    mGetCellState  = il2cpp_class_get_method_from_name_ptr(cells, "GetCellState", 1);
-    mCountEmpty    = il2cpp_class_get_method_from_name_ptr(cells, "CountEmptyCells", 0);
-    mIsAllFull     = il2cpp_class_get_method_from_name_ptr(cells, "IsAllCellsFull", 0);
+    mGetCellAnswer = api_class_get_method_from_name(cls, "GetCellAnswer", 1);
+    mSetCell       = api_class_get_method_from_name(cls, "SetCell",       2);
+    mIsCellMutable = api_class_get_method_from_name(cls, "IsCellMutable", 1);
+    mGetCellState  = api_class_get_method_from_name(cls, "GetCellState",  1);
+    mCountEmpty    = api_class_get_method_from_name(cls, "CountEmptyCells",0);
 
-    NSLog(@"[SS] methods — answer:%p set:%p mutable:%p state:%p empty:%p full:%p",
-          mGetCellAnswer, mSetCell, mIsCellMutable, mGetCellState, mCountEmpty, mIsAllFull);
+    NSLog(@"[SS] methods: answer=%p set=%p mutable=%p state=%p empty=%p",
+          mGetCellAnswer, mSetCell, mIsCellMutable, mGetCellState, mCountEmpty);
 
     return (mGetCellAnswer && mSetCell);
 }
 
+// ================================================================
+#pragma mark - Targeted hook: BoardModelCells.GetCellState
+// ================================================================
+// Hook ONE specific IL2CPP method to capture the `this` pointer.
+// GetCellState is called when the board renders — not super hot,
+// and gives us the instance immediately when the board is visible.
+
+static int (*orig_GetCellState)(void *self, int index, const Il2CppMethodInfo *method);
+
+static int hook_GetCellState(void *self, int index, const Il2CppMethodInfo *method) {
+    if (!gCellsInstance && self) {
+        gCellsInstance = self;
+        NSLog(@"[SS] captured BoardModelCells instance %p", self);
+    }
+    return orig_GetCellState(self, index, method);
+}
+
+static void installTargetedHook(void) {
+    if (gHooked) return;
+    if (!mGetCellState) return;
+
+    // il2cpp MethodInfo has methodPointer as its first field
+    void *funcPtr = *(void **)mGetCellState;
+    if (!funcPtr) { NSLog(@"[SS] method pointer is null"); return; }
+
+    MSHookFunction(funcPtr, (void *)hook_GetCellState, (void **)&orig_GetCellState);
+    gHooked = YES;
+    NSLog(@"[SS] hooked GetCellState at %p", funcPtr);
+}
+
+// ================================================================
 #pragma mark - IL2CPP invoke helpers
+// ================================================================
 
-static int invokeInt(const Il2CppMethodInfo *m, void *obj, int arg) {
+static int callInt(const Il2CppMethodInfo *m, void *obj, int a) {
     Il2CppObject *exc = NULL;
-    void *args[1] = { &arg };
-    Il2CppObject *ret = il2cpp_runtime_invoke_ptr(m, obj, args, &exc);
-    if (exc || !ret) return -1;
-    return *(int *)il2cpp_object_unbox_ptr(ret);
+    void *args[] = { &a };
+    Il2CppObject *r = api_runtime_invoke(m, obj, args, &exc);
+    if (exc || !r) return -1;
+    return *(int *)api_object_unbox(r);
 }
 
-static BOOL invokeBool(const Il2CppMethodInfo *m, void *obj, int arg) {
+static BOOL callBool(const Il2CppMethodInfo *m, void *obj, int a) {
     Il2CppObject *exc = NULL;
-    void *args[1] = { &arg };
-    Il2CppObject *ret = il2cpp_runtime_invoke_ptr(m, obj, args, &exc);
-    if (exc || !ret) return NO;
-    return *(bool *)il2cpp_object_unbox_ptr(ret);
+    void *args[] = { &a };
+    Il2CppObject *r = api_runtime_invoke(m, obj, args, &exc);
+    if (exc || !r) return NO;
+    return *(bool *)api_object_unbox(r);
 }
 
-static void invokeSetCell(void *obj, int idx, int val) {
+static void callSetCell(void *obj, int idx, int val) {
     Il2CppObject *exc = NULL;
-    void *args[2] = { &idx, &val };
-    il2cpp_runtime_invoke_ptr(mSetCell, obj, args, &exc);
+    void *args[] = { &idx, &val };
+    api_runtime_invoke(mSetCell, obj, args, &exc);
 }
 
-#pragma mark - Live solve
+// ================================================================
+#pragma mark - Live solve via IL2CPP
+// ================================================================
 
 static BOOL solveLive(void) {
-    if (!gBoardReady || !gCellsInstance) return NO;
-    if (!mGetCellAnswer || !mSetCell) return NO;
-
-    NSLog(@"[SS] solving live, board size %d", gBoardSize);
+    if (!gCellsInstance || !mGetCellAnswer || !mSetCell) return NO;
 
     int filled = 0;
-    for (int i = 0; i < gBoardSize; i++) {
-        // Skip constant / already-correct cells
-        if (mIsCellMutable && !invokeBool(mIsCellMutable, gCellsInstance, i))
-            continue;
-
+    for (int i = 0; i < 81; i++) {
+        // Skip preset / already correct
         if (mGetCellState) {
-            int state = invokeInt(mGetCellState, gCellsInstance, i);
-            if (state == 2 || state == 3) continue; // Ok or Constant
+            int st = callInt(mGetCellState, gCellsInstance, i);
+            if (st == 2 || st == 3) continue;  // Ok or Constant
+        } else if (mIsCellMutable) {
+            if (!callBool(mIsCellMutable, gCellsInstance, i)) continue;
         }
 
-        int answer = invokeInt(mGetCellAnswer, gCellsInstance, i);
-        if (answer > 0) {
-            invokeSetCell(gCellsInstance, i, answer);
+        int answer = callInt(mGetCellAnswer, gCellsInstance, i);
+        if (answer > 0 && answer <= 9) {
+            callSetCell(gCellsInstance, i, answer);
             filled++;
         }
     }
 
-    NSLog(@"[SS] filled %d cells", filled);
-    return (filled > 0);
+    NSLog(@"[SS] live: filled %d cells", filled);
+    return filled > 0;
 }
 
-#pragma mark - SQLite fallback
+// ================================================================
+#pragma mark - SQLite DB solve (fallback)
+// ================================================================
 
 static NSString *findDB(void) {
-    if (gDBPath) return gDBPath;
-
     NSString *home = NSHomeDirectory();
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *dirs = @[@"Documents", @"Library", @"Library/Application Support"];
 
-    for (NSString *sub in dirs) {
-        NSString *dir = [home stringByAppendingPathComponent:sub];
-        for (NSString *f in [fm contentsOfDirectoryAtPath:dir error:nil]) {
-            if (![f hasSuffix:@".db"] && ![f hasSuffix:@".sqlite"] && ![f hasSuffix:@".sqlite3"])
-                continue;
-            NSString *full = [dir stringByAppendingPathComponent:f];
+    // Search common locations
+    NSArray *dirs = @[
+        [home stringByAppendingPathComponent:@"Documents"],
+        [home stringByAppendingPathComponent:@"Library"],
+        [home stringByAppendingPathComponent:@"Library/Application Support"],
+    ];
+
+    for (NSString *dir in dirs) {
+        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *f in files) {
+            if (![f hasSuffix:@".db"] && ![f hasSuffix:@".sqlite"]
+                && ![f hasSuffix:@".sqlite3"]) continue;
+
+            NSString *path = [dir stringByAppendingPathComponent:f];
             sqlite3 *db;
-            if (sqlite3_open_v2([full UTF8String], &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-                sqlite3_stmt *st;
-                if (sqlite3_prepare_v2(db,
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='SudokuGame'",
-                        -1, &st, NULL) == SQLITE_OK) {
-                    if (sqlite3_step(st) == SQLITE_ROW)
-                        gDBPath = [full copy];
-                    sqlite3_finalize(st);
-                }
-                sqlite3_close(db);
-                if (gDBPath) { NSLog(@"[SS] db: %@", gDBPath); return gDBPath; }
-            }
-        }
-    }
+            if (sqlite3_open_v2([path UTF8String], &db,
+                    SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) continue;
 
-    // Deep search in Documents
-    NSDirectoryEnumerator *en = [fm enumeratorAtPath:[home stringByAppendingPathComponent:@"Documents"]];
-    NSString *f;
-    while ((f = [en nextObject])) {
-        if (![f hasSuffix:@".db"] && ![f hasSuffix:@".sqlite3"]) continue;
-        NSString *full = [[home stringByAppendingPathComponent:@"Documents"]
-                            stringByAppendingPathComponent:f];
-        sqlite3 *db;
-        if (sqlite3_open_v2([full UTF8String], &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
             sqlite3_stmt *st;
+            BOOL found = NO;
             if (sqlite3_prepare_v2(db,
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='SudokuGame'",
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='SudokuGame'",
                     -1, &st, NULL) == SQLITE_OK) {
-                if (sqlite3_step(st) == SQLITE_ROW)
-                    gDBPath = [full copy];
+                found = (sqlite3_step(st) == SQLITE_ROW);
                 sqlite3_finalize(st);
             }
             sqlite3_close(db);
-            if (gDBPath) return gDBPath;
+            if (found) {
+                NSLog(@"[SS] found db: %@", path);
+                return path;
+            }
         }
     }
+
+    // Deep search Documents recursively
+    NSString *docs = [home stringByAppendingPathComponent:@"Documents"];
+    NSDirectoryEnumerator *en = [fm enumeratorAtPath:docs];
+    NSString *f;
+    while ((f = [en nextObject])) {
+        if (![f hasSuffix:@".db"] && ![f hasSuffix:@".sqlite3"]) continue;
+        NSString *path = [docs stringByAppendingPathComponent:f];
+        sqlite3 *db;
+        if (sqlite3_open_v2([path UTF8String], &db,
+                SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) continue;
+        sqlite3_stmt *st;
+        BOOL found = NO;
+        if (sqlite3_prepare_v2(db,
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='SudokuGame'",
+                -1, &st, NULL) == SQLITE_OK) {
+            found = (sqlite3_step(st) == SQLITE_ROW);
+            sqlite3_finalize(st);
+        }
+        sqlite3_close(db);
+        if (found) return path;
+    }
+
     return nil;
 }
 
 static BOOL solveDB(void) {
     NSString *dbPath = findDB();
-    if (!dbPath) { NSLog(@"[SS] db not found"); return NO; }
+    if (!dbPath) { NSLog(@"[SS] no db found"); return NO; }
 
     sqlite3 *db;
     if (sqlite3_open([dbPath UTF8String], &db) != SQLITE_OK) return NO;
@@ -279,58 +281,59 @@ static BOOL solveDB(void) {
     BOOL ok = NO;
     sqlite3_stmt *st;
 
-    // Read solution
     if (sqlite3_prepare_v2(db,
-            "SELECT solution, cells FROM SudokuGame "
-            "WHERE state != 'COMPLETED' ORDER BY lastPlayed DESC LIMIT 1",
+            "SELECT solution FROM SudokuGame "
+            "WHERE state != 'COMPLETED' "
+            "ORDER BY lastPlayed DESC LIMIT 1",
             -1, &st, NULL) == SQLITE_OK) {
         if (sqlite3_step(st) == SQLITE_ROW) {
             const char *sol = (const char *)sqlite3_column_text(st, 0);
-            const char *cur = (const char *)sqlite3_column_text(st, 1);
-            if (sol && cur) {
-                NSLog(@"[SS] solution len=%lu  cells len=%lu",
-                      strlen(sol), strlen(cur));
+            if (sol && strlen(sol) > 0) {
+                NSLog(@"[SS] solution: %.20s... (len=%lu)", sol, strlen(sol));
 
-                // Write solution as cells
                 sqlite3_stmt *upd;
                 if (sqlite3_prepare_v2(db,
-                        "UPDATE SudokuGame SET cells = ?, "
-                        "mistakesCount = 0, mistakesCountAll = 0 "
+                        "UPDATE SudokuGame SET cells = ? "
                         "WHERE state != 'COMPLETED' "
                         "ORDER BY lastPlayed DESC LIMIT 1",
                         -1, &upd, NULL) == SQLITE_OK) {
                     sqlite3_bind_text(upd, 1, sol, -1, SQLITE_TRANSIENT);
                     ok = (sqlite3_step(upd) == SQLITE_DONE);
                     sqlite3_finalize(upd);
+                    if (ok) NSLog(@"[SS] db updated");
                 }
             }
         }
         sqlite3_finalize(st);
     }
-
     sqlite3_close(db);
-    NSLog(@"[SS] db solve %s", ok ? "OK" : "FAIL");
     return ok;
 }
 
-#pragma mark - Toast helper
+// ================================================================
+#pragma mark - UI helpers
+// ================================================================
+
+static UIWindow *getKeyWindow(void) {
+    for (UIWindowScene *sc in [UIApplication sharedApplication].connectedScenes) {
+        if (sc.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *w in sc.windows) {
+                if (w.isKeyWindow) return w;
+            }
+        }
+    }
+    return nil;
+}
 
 static void showToast(NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *win = nil;
-        for (UIWindowScene *sc in [UIApplication sharedApplication].connectedScenes) {
-            if (sc.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *w in sc.windows) {
-                    if (w.isKeyWindow) { win = w; break; }
-                }
-            }
-        }
+        UIWindow *win = getKeyWindow();
         if (!win) return;
 
         UILabel *t = [[UILabel alloc] init];
         t.text = msg;
-        t.textColor = [UIColor whiteColor];
-        t.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
+        t.textColor = UIColor.whiteColor;
+        t.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.85];
         t.textAlignment = NSTextAlignmentCenter;
         t.font = [UIFont boldSystemFontOfSize:14];
         t.layer.cornerRadius = 14;
@@ -339,106 +342,307 @@ static void showToast(NSString *msg) {
         [t sizeToFit];
 
         CGRect fr = t.frame;
-        fr.size.width += 32;
+        fr.size.width  += 32;
         fr.size.height += 16;
-        fr.origin.x = (win.bounds.size.width - fr.size.width) / 2;
-        fr.origin.y = win.bounds.size.height - 140;
+        fr.origin.x = (win.bounds.size.width  - fr.size.width)  / 2;
+        fr.origin.y =  win.bounds.size.height - 140;
         t.frame = fr;
         [win addSubview:t];
 
         [UIView animateWithDuration:0.25 animations:^{ t.alpha = 1; }
-            completion:^(BOOL f) {
+         completion:^(BOOL done) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2*NSEC_PER_SEC),
                 dispatch_get_main_queue(), ^{
                 [UIView animateWithDuration:0.25 animations:^{ t.alpha = 0; }
-                    completion:^(BOOL f2) { [t removeFromSuperview]; }];
+                 completion:^(BOOL d2) { [t removeFromSuperview]; }];
             });
         }];
     });
 }
 
-#pragma mark - Solve dispatcher
+// ================================================================
+#pragma mark - Memory Dumper
+// ================================================================
+
+static NSString *dumpDir(void) {
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *dir  = [docs stringByAppendingPathComponent:@"SudokuSolver"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+// Dump a single Mach-O image from memory (decrypted)
+static BOOL dumpMachO(const struct mach_header_64 *header, const char *name, NSString *outPath) {
+    if (!header || header->magic != MH_MAGIC_64) return NO;
+
+    // First pass: find __TEXT vmaddr (for slide calc) and total file size
+    const uint8_t *ptr = (const uint8_t *)header + sizeof(struct mach_header_64);
+    uint64_t fileSize = 0;
+    uint64_t textVMAddr = 0;
+
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)ptr;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
+            uint64_t end = seg->fileoff + seg->filesize;
+            if (end > fileSize) fileSize = end;
+            if (strcmp(seg->segname, "__TEXT") == 0) textVMAddr = seg->vmaddr;
+        }
+        ptr += lc->cmdsize;
+    }
+
+    if (fileSize == 0 || textVMAddr == 0) return NO;
+
+    intptr_t slide = (intptr_t)header - (intptr_t)textVMAddr;
+
+    // Allocate output buffer
+    NSMutableData *data = [NSMutableData dataWithLength:(NSUInteger)fileSize];
+    if (!data) return NO;
+    uint8_t *buf = (uint8_t *)data.mutableBytes;
+
+    // Second pass: copy each segment from memory into its fileoff position
+    ptr = (const uint8_t *)header + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)ptr;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
+            if (seg->filesize > 0 && seg->vmsize > 0 && seg->fileoff + seg->filesize <= fileSize) {
+                const uint8_t *segData = (const uint8_t *)(seg->vmaddr + slide);
+
+                // Verify the memory is readable
+                vm_size_t regionSize = 0;
+                vm_address_t regionAddr = (vm_address_t)segData;
+                vm_region_basic_info_data_64_t info;
+                mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t objName;
+
+                kern_return_t kr = vm_region_64(mach_task_self(), &regionAddr, &regionSize,
+                    VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &objName);
+
+                if (kr == KERN_SUCCESS && (info.protection & VM_PROT_READ)) {
+                    memcpy(buf + seg->fileoff, segData, (size_t)seg->filesize);
+                }
+            }
+        }
+        ptr += lc->cmdsize;
+    }
+
+    // Third pass: clear cryptid so tools know this is decrypted
+    ptr = buf + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)ptr;
+        if (lc->cmd == LC_ENCRYPTION_INFO_64) {
+            struct encryption_info_command_64 *enc = (struct encryption_info_command_64 *)ptr;
+            enc->cryptid = 0;
+            NSLog(@"[SS] cleared cryptid in dump");
+        } else if (lc->cmd == LC_ENCRYPTION_INFO) {
+            struct encryption_info_command *enc = (struct encryption_info_command *)ptr;
+            enc->cryptid = 0;
+        }
+        ptr += lc->cmdsize;
+    }
+
+    return [data writeToFile:outPath atomically:YES];
+}
+
+static void performDump(void) {
+    NSLog(@"[SS] starting memory dump");
+    NSString *dir = dumpDir();
+    NSMutableString *report = [NSMutableString string];
+    int dumped = 0;
+
+    [report appendFormat:@"Dump: %@\n", [NSDate date]];
+    [report appendFormat:@"Bundle: %@\n", [[NSBundle mainBundle] bundleIdentifier]];
+    [report appendFormat:@"Images loaded: %u\n\n", _dyld_image_count()];
+
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        const struct mach_header *hdr = _dyld_get_image_header(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        if (!name || !hdr) continue;
+
+        NSString *imgName = [[NSString stringWithUTF8String:name] lastPathComponent];
+        NSString *imgPath = [NSString stringWithUTF8String:name];
+
+        [report appendFormat:@"[%u] %s\n    base=%p slide=0x%lx magic=0x%x\n",
+            i, name, hdr, (long)slide, hdr->magic];
+
+        // Only dump the main binary, UnityFramework, and any game-specific libs
+        BOOL shouldDump = NO;
+        if ([imgName isEqualToString:@"Sudoku"] ||
+            [imgName containsString:@"UnityFramework"] ||
+            [imgName containsString:@"GameAssembly"] ||
+            [imgName containsString:@"easybrain"] ||
+            [imgPath containsString:[[NSBundle mainBundle] bundlePath]]) {
+            shouldDump = YES;
+        }
+
+        // Also dump if it's the main executable (index 0)
+        if (i == 0) shouldDump = YES;
+
+        if (shouldDump && hdr->magic == MH_MAGIC_64) {
+            NSString *outFile = [dir stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"%@.decrypted", imgName]];
+
+            BOOL ok = dumpMachO((const struct mach_header_64 *)hdr, name, outFile);
+            [report appendFormat:@"    → DUMPED: %@ (%@)\n", imgName, ok ? @"OK" : @"FAIL"];
+            if (ok) dumped++;
+        }
+    }
+
+    // Also copy global-metadata.dat if we can find it
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    NSArray *metaPaths = @[
+        [bundlePath stringByAppendingPathComponent:@"Data/Managed/Metadata/global-metadata.dat"],
+        [bundlePath stringByAppendingPathComponent:@"Frameworks/UnityFramework.framework/Data/Managed/Metadata/global-metadata.dat"],
+    ];
+
+    for (NSString *mp in metaPaths) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:mp]) {
+            NSString *dst = [dir stringByAppendingPathComponent:@"global-metadata.dat"];
+            [[NSFileManager defaultManager] copyItemAtPath:mp toPath:dst error:nil];
+            [report appendFormat:@"\nglobal-metadata.dat: copied from %@\n", mp];
+            dumped++;
+            break;
+        }
+    }
+
+    // Copy the sqlite DB too
+    NSString *dbPath = findDB();
+    if (dbPath) {
+        NSString *dst = [dir stringByAppendingPathComponent:
+            [dbPath lastPathComponent]];
+        [[NSFileManager defaultManager] copyItemAtPath:dbPath toPath:dst error:nil];
+        [report appendFormat:@"\nSQLite DB: copied %@\n", [dbPath lastPathComponent]];
+        dumped++;
+    }
+
+    // Write the report
+    [report appendFormat:@"\nTotal dumped: %d files\n", dumped];
+    NSString *reportPath = [dir stringByAppendingPathComponent:@"dump_report.txt"];
+    [report writeToFile:reportPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    NSLog(@"[SS] dump complete: %d files → %@", dumped, dir);
+}
+
+static void onDumpTapped(void) {
+    showToast(@"Dumping memory...");
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        performDump();
+
+        NSString *dir = dumpDir();
+        NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+
+        // Calculate total size
+        unsigned long long totalSize = 0;
+        for (NSString *f in files) {
+            NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:
+                [dir stringByAppendingPathComponent:f] error:nil];
+            totalSize += [attr fileSize];
+        }
+
+        NSString *msg = [NSString stringWithFormat:@"Dumped %lu files (%.1f MB)\n→ Documents/SudokuSolver/",
+            (unsigned long)files.count, totalSize / 1048576.0];
+        showToast(msg);
+    });
+}
+
+// ================================================================
+#pragma mark - Solve button action
+// ================================================================
 
 static void onSolveTapped(void) {
-    NSLog(@"[SS] solve tapped — il2cpp:%d board:%d", gIL2CPPReady, gBoardReady);
+    NSLog(@"[SS] solve tapped");
 
-    // Try live solve first
-    if (gIL2CPPReady && gBoardReady) {
-        if (!mGetCellAnswer) resolveMethods();
+    // Lazy-init everything on first tap
+    if (!gIL2CPPResolved) resolveAPI();
+    if (gIL2CPPResolved && !mGetCellAnswer) resolveMethods();
+    if (gIL2CPPResolved && mGetCellState && !gHooked) installTargetedHook();
+
+    // Try live solve
+    if (gCellsInstance && mGetCellAnswer && mSetCell) {
         if (solveLive()) {
-            showToast(@"✅ Solved!");
+            showToast(@"Solved!");
             return;
         }
     }
 
     // Fall back to DB
     if (solveDB()) {
-        showToast(@"✅ Solved via DB — tap ↩ to reload");
+        showToast(@"Solved (restart level to see)");
     } else {
-        showToast(@"❌ No active game found");
+        showToast(@"No active game found");
     }
 }
 
+// ================================================================
 #pragma mark - Floating button
+// ================================================================
+
+@interface SSSolveButton : UIButton
+@end
+
+@implementation SSSolveButton
+
+- (void)ssTap      { onSolveTapped(); }
+- (void)ssDumpLong:(UILongPressGestureRecognizer *)g {
+    if (g.state == UIGestureRecognizerStateBegan) onDumpTapped();
+}
+
+- (void)ssPan:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:self.superview];
+    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
+    [g setTranslation:CGPointZero inView:self.superview];
+}
+
+@end
+
+static SSSolveButton *gBtn = nil;
 
 static void addButton(UIWindow *win) {
-    if (gBtnAdded || !win) return;
+    if (gBtn || !win) return;
 
-    gSolveBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    gSolveBtn.frame = CGRectMake(win.bounds.size.width - 66, 100, 52, 52);
-    gSolveBtn.backgroundColor = [UIColor colorWithRed:0.18 green:0.65 blue:0.35 alpha:0.92];
-    gSolveBtn.layer.cornerRadius = 26;
-    gSolveBtn.layer.shadowColor   = [UIColor blackColor].CGColor;
-    gSolveBtn.layer.shadowOffset  = CGSizeMake(0, 2);
-    gSolveBtn.layer.shadowOpacity = 0.35;
-    gSolveBtn.layer.shadowRadius  = 4;
+    gBtn = [SSSolveButton buttonWithType:UIButtonTypeCustom];
+    gBtn.frame = CGRectMake(win.bounds.size.width - 66, 100, 52, 52);
+    gBtn.backgroundColor = [UIColor colorWithRed:0.18 green:0.65 blue:0.35 alpha:0.92];
+    gBtn.layer.cornerRadius = 26;
+    gBtn.layer.shadowColor   = UIColor.blackColor.CGColor;
+    gBtn.layer.shadowOffset  = CGSizeMake(0, 2);
+    gBtn.layer.shadowOpacity = 0.35;
+    gBtn.layer.shadowRadius  = 4;
+    [gBtn setTitle:@"⚡" forState:UIControlStateNormal];
+    gBtn.titleLabel.font = [UIFont systemFontOfSize:22];
 
-    [gSolveBtn setTitle:@"⚡" forState:UIControlStateNormal];
-    gSolveBtn.titleLabel.font = [UIFont systemFontOfSize:22];
-
-    [gSolveBtn addTarget:[NSNull null]
-                  action:@selector(ssTapped)
-        forControlEvents:UIControlEventTouchUpInside];
+    [gBtn addTarget:gBtn action:@selector(ssTap)
+      forControlEvents:UIControlEventTouchUpInside];
 
     UIPanGestureRecognizer *pan =
-        [[UIPanGestureRecognizer alloc] initWithTarget:[NSNull null]
-                                                action:@selector(ssPan:)];
-    [gSolveBtn addGestureRecognizer:pan];
+        [[UIPanGestureRecognizer alloc] initWithTarget:gBtn action:@selector(ssPan:)];
+    [gBtn addGestureRecognizer:pan];
 
-    [win addSubview:gSolveBtn];
-    gBtnAdded = YES;
+    UILongPressGestureRecognizer *lp =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:gBtn action:@selector(ssDumpLong:)];
+    lp.minimumPressDuration = 1.5;
+    [gBtn addGestureRecognizer:lp];
+
+    [win addSubview:gBtn];
     NSLog(@"[SS] button added");
 }
 
-#pragma mark - NSNull category for button actions
-
-@interface NSNull (SS)
-- (void)ssTapped;
-- (void)ssPan:(UIPanGestureRecognizer *)g;
-@end
-
-@implementation NSNull (SS)
-- (void)ssTapped { onSolveTapped(); }
-- (void)ssPan:(UIPanGestureRecognizer *)g {
-    UIView *v = g.view;
-    CGPoint t = [g translationInView:v.superview];
-    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
-    [g setTranslation:CGPointZero inView:v.superview];
-}
-@end
-
-#pragma mark - Hooks
-
-// Capture the active BoardModelCells instance when the board initialises.
-// BoardModelCells.Init() is called every time a level starts.
-// We can't hook C# methods directly by name without offsets, so we use a
-// UnityAppController hook + periodic polling instead.
+// ================================================================
+#pragma mark - Hooks (minimal — just UIWindow for the button)
+// ================================================================
 
 %hook UIWindow
 
 - (void)makeKeyAndVisible {
     %orig;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+
+    // Delay so the app finishes setting up its UI first
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
         addButton(self);
     });
@@ -446,115 +650,16 @@ static void addButton(UIWindow *win) {
 
 %end
 
-// Poll for il2cpp readiness after Unity finishes loading.
-// UnityAppController is the standard Unity iOS app delegate class name.
-%hook UnityAppController
-
-- (void)applicationDidBecomeActive:(UIApplication *)app {
-    %orig;
-
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSLog(@"[SS] unity active");
-        dispatch_async(dispatch_get_global_queue(0, 0), ^{
-            // Give Unity a moment to finish init
-            [NSThread sleepForTimeInterval:1.5];
-            resolveIL2CPP();
-            if (gIL2CPPReady) {
-                installInvokeHook();
-                resolveMethods();
-            }
-            findDB();
-        });
-    });
-}
-
-%end
-
-// Hook sqlite3_open to auto-detect the game database path
-%hookf(int, sqlite3_open, const char *filename, sqlite3 **ppDb) {
-    int r = %orig;
-    if (r == SQLITE_OK && filename && !gDBPath) {
-        NSString *path = [NSString stringWithUTF8String:filename];
-        if ([path containsString:@"SudokuGame"] ||
-            [path containsString:@"sudoku"]) {
-            gDBPath = [path copy];
-            NSLog(@"[SS] captured db open: %@", gDBPath);
-        } else {
-            // Check if this DB has SudokuGame table
-            sqlite3_stmt *st;
-            if (sqlite3_prepare_v2(*ppDb,
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='SudokuGame'",
-                    -1, &st, NULL) == SQLITE_OK) {
-                if (sqlite3_step(st) == SQLITE_ROW) {
-                    gDBPath = [path copy];
-                    NSLog(@"[SS] captured db (has SudokuGame): %@", gDBPath);
-                }
-                sqlite3_finalize(st);
-            }
-        }
-    }
-    return r;
-}
-
-%hookf(int, sqlite3_open_v2, const char *filename, sqlite3 **ppDb, int flags, const char *zVfs) {
-    int r = %orig;
-    if (r == SQLITE_OK && filename && !gDBPath) {
-        NSString *path = [NSString stringWithUTF8String:filename];
-        if ([path containsString:@"SudokuGame"] ||
-            [path containsString:@"sudoku"]) {
-            gDBPath = [path copy];
-            NSLog(@"[SS] captured db open_v2: %@", gDBPath);
-        }
-    }
-    return r;
-}
-
-// ---- Manual hook of il2cpp_runtime_invoke (deferred) ----
-// We can't use %hookf because the symbol lives in UnityFramework
-// which isn't loaded yet when our tweak's %init runs.
-// Instead we use MSHookFunction after il2cpp is ready.
-
-static void *(*orig_il2cpp_runtime_invoke)(const void *, void *, void **, void **) = NULL;
-
-static void *hooked_il2cpp_runtime_invoke(const void *method, void *obj, void **params, void **exc) {
-    void *ret = orig_il2cpp_runtime_invoke(method, obj, params, exc);
-
-    if (gBoardReady || !obj) return ret;
-    if (!il2cpp_object_get_class_ptr || !il2cpp_class_get_name_ptr) return ret;
-
-    @try {
-        Il2CppClass *klass = il2cpp_object_get_class_ptr((Il2CppObject *)obj);
-        if (!klass) return ret;
-        const char *name = il2cpp_class_get_name_ptr(klass);
-        if (name && strcmp(name, "BoardModelCells") == 0) {
-            gCellsInstance = obj;
-            gBoardReady = YES;
-            NSLog(@"[SS] captured BoardModelCells @ %p", obj);
-            if (!mGetCellAnswer) resolveMethods();
-        }
-    } @catch (NSException *e) {}
-
-    return ret;
-}
-
-// Called once il2cpp is loaded to install the invoke hook
-static void installInvokeHook(void) {
-    void *sym = dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
-    if (!sym) { NSLog(@"[SS] il2cpp_runtime_invoke not found for hook"); return; }
-    MSHookFunction(sym, (void *)hooked_il2cpp_runtime_invoke,
-                   (void **)&orig_il2cpp_runtime_invoke);
-    NSLog(@"[SS] invoke hook installed");
-}
-
+// ================================================================
 #pragma mark - Constructor
+// ================================================================
 
 %ctor {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     NSLog(@"[SS] loaded in %@", bid);
 
     if (![bid containsString:@"easybrain"]) {
-        NSLog(@"[SS] not target app, skipping");
+        NSLog(@"[SS] wrong app, skipping");
         return;
     }
 
