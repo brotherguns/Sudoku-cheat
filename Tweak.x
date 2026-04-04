@@ -1,14 +1,26 @@
 /*
- * SudokuSolver v5 — Easybrain Sudoku (com.easybrain.sudoku)
+ * SudokuSolver v6 — Easybrain Sudoku (com.easybrain.sudoku)
  *
- * The data blob contains TWO 81-cell grids:
- *   grid 0 (given cells)  — puzzle clues, fixed, game ignores player writes here
- *   grid 1 (player cells) — player's entries, all zeros on a fresh board ← patch here
+ * ROOT CAUSE (previous versions):
+ *   Unity's OnApplicationPause() fires on background and the game saves
+ *   the level state back to saved_progress.data, OVERWRITING our patch.
+ *   We were patching before the game saved, so the patch was lost.
  *
- * The level blob contains the solution as the first all-nonzero 81-cell grid.
+ * FIX:
+ *   Hook UnityAppController's -applicationDidEnterBackground: which fires
+ *   AFTER OnApplicationPause / the game's save. We patch there instead,
+ *   0.5 s after the notification to let any async writes finish.
  *
- * Tap  ⚡ = fill player cells with solution (only blank cells), save to DB
- * Long ⚡ = dump decrypted binaries + metadata → Documents/SudokuSolver/
+ * Blob layout (confirmed from memory dump):
+ *   level blob → grid[0] @+106  : solution (all 1-9, no zeros)
+ *   level blob → grid[1] @+432  : puzzle / given cells (zeros = blank)
+ *   data  blob → grid[0] @+227  : given cells (mirrors level grid[1])
+ *   data  blob → grid[1] @+552  : player entries (zeros = not entered) ← PATCH HERE
+ *
+ * Usage:
+ *   Tap  ⚡  = arm the solve (shows instructions)
+ *   Press home button → app backgrounds → patch fires → force-close → reopen = solved
+ *   Long ⚡  = dump decrypted binaries → Documents/SudokuSolver/
  */
 
 #import <UIKit/UIKit.h>
@@ -23,7 +35,8 @@
 #pragma mark - Globals
 // ================================================================
 
-static NSString *gDBPath = nil;
+static NSString *gDBPath    = nil;
+static BOOL      gSolvePending = NO;   // armed by ⚡ tap, consumed on background
 
 // ================================================================
 #pragma mark - Toast
@@ -45,7 +58,7 @@ static void showToast(NSString *msg) {
         t.text = msg;
         t.numberOfLines = 0;
         t.textColor = UIColor.whiteColor;
-        t.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.85];
+        t.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.88];
         t.textAlignment = NSTextAlignmentCenter;
         t.font = [UIFont boldSystemFontOfSize:13];
         t.layer.cornerRadius = 14;
@@ -64,11 +77,11 @@ static void showToast(NSString *msg) {
         [win addSubview:t];
 
         [UIView animateWithDuration:0.25 animations:^{ t.alpha = 1; }
-         completion:^(BOOL d) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC),
+         completion:^(BOOL _) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4*NSEC_PER_SEC),
                 dispatch_get_main_queue(), ^{
                 [UIView animateWithDuration:0.25 animations:^{ t.alpha = 0; }
-                 completion:^(BOOL d2) { [t removeFromSuperview]; }];
+                 completion:^(BOOL _) { [t removeFromSuperview]; }];
             });
         }];
     });
@@ -135,7 +148,6 @@ static NSString *findDB(void) {
             [candidates addObject:full];
     }
 
-    NSLog(@"[SS] %lu SQLite candidates", (unsigned long)candidates.count);
     for (NSString *c in candidates) {
         if (hasGameTable(c)) {
             gDBPath = [c copy];
@@ -147,75 +159,61 @@ static NSString *findDB(void) {
 }
 
 // ================================================================
-#pragma mark - Blob grid scanner
+#pragma mark - Blob grid helpers
 // ================================================================
 
-/*
- * findAllGrids — collect all offsets in a blob where 81 consecutive
- * uint32 LE values are all within [0..9].
- * Returns NSArray of NSNumbers (byte offsets).
- * Each match advances past the full 324-byte grid to avoid overlap.
- */
+/* Returns array of @(byte_offset) for every run of 81 uint32 LE values all in [0..9].
+   Advances past each grid to avoid overlaps. */
 static NSArray *findAllGrids(const uint8_t *bytes, NSInteger len) {
-    NSMutableArray *result = [NSMutableArray array];
-    NSInteger limit = len - 81 * 4;
-    NSInteger off = 0;
+    NSMutableArray *r = [NSMutableArray array];
+    NSInteger limit = len - 81 * 4, off = 0;
     while (off <= limit) {
-        BOOL valid = YES;
+        BOOL ok = YES;
         for (int i = 0; i < 81; i++) {
-            uint32_t v;
-            memcpy(&v, bytes + off + i * 4, 4);
-            if (v > 9) { valid = NO; break; }
+            uint32_t v; memcpy(&v, bytes + off + i*4, 4);
+            if (v > 9) { ok = NO; break; }
         }
-        if (valid) {
-            [result addObject:@(off)];
-            off += 81 * 4; // skip past this grid
-        } else {
-            off++;
-        }
+        if (ok) { [r addObject:@(off)]; off += 81*4; }
+        else    off++;
     }
-    return result;
+    return r;
 }
 
-/*
- * findSolutionGrid — first grid in blob where all 81 values are 1-9 (no zeros).
- * Returns byte offset, or -1 if not found.
- */
+/* First grid where all 81 values are in [1..9] (no zeros = solution). */
 static NSInteger findSolutionGrid(const uint8_t *bytes, NSInteger len) {
-    NSInteger limit = len - 81 * 4;
+    NSInteger limit = len - 81*4;
     for (NSInteger off = 0; off <= limit; off++) {
-        BOOL valid = YES;
+        BOOL ok = YES;
         for (int i = 0; i < 81; i++) {
-            uint32_t v;
-            memcpy(&v, bytes + off + i * 4, 4);
-            if (v < 1 || v > 9) { valid = NO; break; }
+            uint32_t v; memcpy(&v, bytes + off + i*4, 4);
+            if (v < 1 || v > 9) { ok = NO; break; }
         }
-        if (valid) return off;
+        if (ok) return off;
     }
     return -1;
 }
 
 // ================================================================
-#pragma mark - Solve via DB
+#pragma mark - Core solve logic
 // ================================================================
 
 static NSString *solveViaDB(void) {
+    // invalidate cached path so we re-discover (DB might have moved)
     NSString *dbPath = findDB();
-    if (!dbPath) return @"No game database found.\nStart a puzzle first.";
+    if (!dbPath) return @"No game DB found.\nStart a puzzle first.";
 
     sqlite3 *db;
     if (sqlite3_open([dbPath UTF8String], &db) != SQLITE_OK)
-        return @"Failed to open database.";
+        return @"Failed to open DB.";
 
     NSString *result = nil;
     sqlite3_stmt *st;
-
-    const char *query =
+    const char *q =
         "SELECT sp.rowid, sp.data, sp.level "
         "FROM saved_progress sp "
         "ORDER BY sp.time_unix DESC LIMIT 1";
 
-    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, q, -1, &st, NULL) == SQLITE_OK) {
         if (sqlite3_step(st) == SQLITE_ROW) {
             sqlite3_int64 rowid  = sqlite3_column_int64(st, 0);
             const void *rawData  = sqlite3_column_blob(st, 1);
@@ -226,76 +224,66 @@ static NSString *solveViaDB(void) {
             NSLog(@"[SS] rowid=%lld data=%d level=%d", rowid, dataLen, levelLen);
 
             if (!rawData || !rawLevel || dataLen < 81*4*2 || levelLen < 81*4) {
-                // data must hold at least 2 grids (given + player)
-                result = @"Blob too small — unexpected format.";
+                result = @"Blob too small.";
             } else {
-                const uint8_t *dataBytes  = (const uint8_t *)rawData;
-                const uint8_t *levelBytes = (const uint8_t *)rawLevel;
+                const uint8_t *dB = (const uint8_t *)rawData;
+                const uint8_t *lB = (const uint8_t *)rawLevel;
 
-                // 1. Extract solution from level blob (first all-nonzero grid)
-                NSInteger solOff = findSolutionGrid(levelBytes, levelLen);
+                // 1. Extract solution from level blob
+                NSInteger solOff = findSolutionGrid(lB, levelLen);
                 if (solOff < 0) {
                     result = @"Solution not found in level blob.";
                 } else {
-                    uint32_t solution[81];
+                    uint32_t sol[81];
                     for (int i = 0; i < 81; i++)
-                        memcpy(&solution[i], levelBytes + solOff + i*4, 4);
+                        memcpy(&sol[i], lB + solOff + i*4, 4);
+                    NSLog(@"[SS] solution @level+%ld: %u %u %u…", (long)solOff, sol[0], sol[1], sol[2]);
 
-                    NSLog(@"[SS] solution at level+%ld: %u %u %u …",
-                          (long)solOff, solution[0], solution[1], solution[2]);
+                    // 2. Find grids in data blob
+                    //    data grid[0] = given cells  (read-only in-game, has puzzle clues)
+                    //    data grid[1] = player cells (what we write)
+                    NSArray *dGrids = findAllGrids(dB, dataLen);
+                    NSLog(@"[SS] data grids: %lu", (unsigned long)dGrids.count);
 
-                    // 2. Find all 81-cell grids in data blob
-                    //    grid[0] = given cells (puzzle clues, read-only in-game)
-                    //    grid[1] = player entries (what we need to fill)
-                    NSArray *grids = findAllGrids(dataBytes, dataLen);
-                    NSLog(@"[SS] found %lu grids in data blob", (unsigned long)grids.count);
-
-                    if (grids.count < 2) {
+                    if (dGrids.count < 2) {
                         result = [NSString stringWithFormat:
-                            @"Expected 2 cell grids in data blob, found %lu.\n"
-                             "Tap solve after starting a puzzle.", (unsigned long)grids.count];
+                            @"Expected ≥2 grids in data blob, got %lu.", (unsigned long)dGrids.count];
                     } else {
-                        NSInteger givenOff  = [grids[0] integerValue];
-                        NSInteger playerOff = [grids[1] integerValue];
+                        NSInteger givenOff  = [dGrids[0] integerValue];
+                        NSInteger playerOff = [dGrids[1] integerValue];
 
-                        // Read given cells to know which positions are clues
                         uint32_t given[81];
                         for (int i = 0; i < 81; i++)
-                            memcpy(&given[i], dataBytes + givenOff + i*4, 4);
+                            memcpy(&given[i], dB + givenOff + i*4, 4);
 
-                        NSLog(@"[SS] given at data+%ld, player at data+%ld",
-                              (long)givenOff, (long)playerOff);
+                        NSLog(@"[SS] given@data+%ld  player@data+%ld", (long)givenOff, (long)playerOff);
 
-                        // 3. Patch: write solution into player grid for every blank cell
-                        NSMutableData *patched =
-                            [NSMutableData dataWithBytes:rawData length:dataLen];
-                        uint8_t *out = (uint8_t *)patched.mutableBytes;
-
+                        // 3. Patch player cells: write solution for every blank cell
+                        NSMutableData *pd = [NSMutableData dataWithBytes:rawData length:dataLen];
+                        uint8_t *out = (uint8_t *)pd.mutableBytes;
+                        int filled = 0;
                         for (int i = 0; i < 81; i++) {
                             if (given[i] == 0) {
-                                // blank cell → write solution digit
-                                memcpy(out + playerOff + i*4, &solution[i], 4);
+                                memcpy(out + playerOff + i*4, &sol[i], 4);
+                                filled++;
                             }
-                            // given cells: leave player grid as-is (game ignores those anyway)
                         }
+                        NSLog(@"[SS] filled %d blank cells", filled);
 
                         // 4. Write back
                         sqlite3_stmt *upd;
                         if (sqlite3_prepare_v2(db,
-                                "UPDATE saved_progress SET data = ? WHERE rowid = ?",
+                                "UPDATE saved_progress SET data=? WHERE rowid=?",
                                 -1, &upd, NULL) == SQLITE_OK) {
-                            sqlite3_bind_blob(upd, 1,
-                                patched.bytes, (int)patched.length, SQLITE_TRANSIENT);
+                            sqlite3_bind_blob(upd, 1, pd.bytes, (int)pd.length, SQLITE_TRANSIENT);
                             sqlite3_bind_int64(upd, 2, rowid);
                             if (sqlite3_step(upd) == SQLITE_DONE)
-                                result = @"✅ Solved!\nForce-close & reopen to see it.";
+                                result = @"✅ Solved! Force-close & reopen.";
                             else
-                                result = [NSString stringWithFormat:@"Write failed: %s",
-                                          sqlite3_errmsg(db)];
+                                result = [NSString stringWithFormat:@"Write failed: %s", sqlite3_errmsg(db)];
                             sqlite3_finalize(upd);
                         } else {
-                            result = [NSString stringWithFormat:@"Prepare failed: %s",
-                                      sqlite3_errmsg(db)];
+                            result = [NSString stringWithFormat:@"Prepare failed: %s", sqlite3_errmsg(db)];
                         }
                     }
                 }
@@ -326,7 +314,6 @@ static NSString *dumpDir(void) {
 static BOOL dumpImage(const struct mach_header_64 *hdr, intptr_t slide, NSString *outPath) {
     @try {
         if (!hdr || hdr->magic != MH_MAGIC_64) return NO;
-
         const uint8_t *ptr = (const uint8_t *)hdr + sizeof(struct mach_header_64);
         uint64_t fileSize = 0;
         for (uint32_t i = 0; i < hdr->ncmds; i++) {
@@ -338,26 +325,20 @@ static BOOL dumpImage(const struct mach_header_64 *hdr, intptr_t slide, NSString
             }
             ptr += lc->cmdsize;
         }
-        if (fileSize == 0 || fileSize > 500*1024*1024) return NO;
-
+        if (!fileSize || fileSize > 500*1024*1024) return NO;
         NSMutableData *data = [NSMutableData dataWithLength:(NSUInteger)fileSize];
         if (!data) return NO;
         uint8_t *buf = (uint8_t *)data.mutableBytes;
-
         ptr = (const uint8_t *)hdr + sizeof(struct mach_header_64);
         for (uint32_t i = 0; i < hdr->ncmds; i++) {
             const struct load_command *lc = (const struct load_command *)ptr;
             if (lc->cmd == LC_SEGMENT_64) {
                 const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
-                if (seg->filesize > 0 && seg->fileoff + seg->filesize <= fileSize) {
-                    memcpy(buf + seg->fileoff,
-                           (const void *)(seg->vmaddr + slide),
-                           (size_t)seg->filesize);
-                }
+                if (seg->filesize && seg->fileoff + seg->filesize <= fileSize)
+                    memcpy(buf + seg->fileoff, (const void *)(seg->vmaddr + slide), seg->filesize);
             }
             ptr += lc->cmdsize;
         }
-
         ptr = buf + sizeof(struct mach_header_64);
         for (uint32_t i = 0; i < hdr->ncmds; i++) {
             struct load_command *lc = (struct load_command *)ptr;
@@ -365,12 +346,8 @@ static BOOL dumpImage(const struct mach_header_64 *hdr, intptr_t slide, NSString
                 ((struct encryption_info_command_64 *)ptr)->cryptid = 0;
             ptr += lc->cmdsize;
         }
-
         return [data writeToFile:outPath atomically:YES];
-    } @catch (NSException *e) {
-        NSLog(@"[SS] dump exception: %@", e);
-        return NO;
-    }
+    } @catch (NSException *e) { NSLog(@"[SS] dumpImage: %@", e); return NO; }
 }
 
 static void performDump(void) {
@@ -378,7 +355,6 @@ static void performDump(void) {
     NSMutableString *rpt = [NSMutableString string];
     int dumped = 0;
     NSString *appPath = [[NSBundle mainBundle] bundlePath];
-
     [rpt appendFormat:@"Dump: %@\nBundle: %@\nImages: %u\n\n",
         [NSDate date], [[NSBundle mainBundle] bundleIdentifier], _dyld_image_count()];
 
@@ -387,14 +363,10 @@ static void performDump(void) {
         const struct mach_header *hdr = _dyld_get_image_header(i);
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
         if (!name || !hdr) continue;
-
         NSString *path = [NSString stringWithUTF8String:name];
+        if (!((i == 0) || [path containsString:appPath])) continue;
         NSString *imgName = [path lastPathComponent];
-        BOOL shouldDump = (i == 0) || [path containsString:appPath];
-        if (!shouldDump) continue;
-
         [rpt appendFormat:@"[%u] %@\n  base=%p slide=0x%lx\n", i, imgName, hdr, (long)slide];
-
         if (hdr->magic == MH_MAGIC_64) {
             NSString *out = [dir stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"%@.decrypted", imgName]];
@@ -414,34 +386,17 @@ static void performDump(void) {
             NSString *dst = [dir stringByAppendingPathComponent:@"global-metadata.dat"];
             [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
             [[NSFileManager defaultManager] copyItemAtPath:mp toPath:dst error:nil];
-            [rpt appendFormat:@"\nglobal-metadata.dat: copied\n"];
-            dumped++; break;
+            [rpt appendFormat:@"\nglobal-metadata.dat: copied\n"]; dumped++; break;
         }
     }
-
     NSString *dbPath = findDB();
     if (dbPath) {
         NSString *dst = [dir stringByAppendingPathComponent:[dbPath lastPathComponent]];
         [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
         [[NSFileManager defaultManager] copyItemAtPath:dbPath toPath:dst error:nil];
-        [rpt appendFormat:@"\nDB: copied %@\n", [dbPath lastPathComponent]];
-        dumped++;
+        [rpt appendFormat:@"\nDB: %@\n", [dbPath lastPathComponent]]; dumped++;
     }
-
-    NSMutableString *fileList = [NSMutableString stringWithString:@"App container files:\n"];
-    NSString *home = NSHomeDirectory();
-    NSDirectoryEnumerator *en = [[NSFileManager defaultManager] enumeratorAtPath:home];
-    NSString *rel;
-    while ((rel = [en nextObject])) {
-        if ([rel containsString:@".app/"]) { [en skipDescendants]; continue; }
-        NSDictionary *attr = [[NSFileManager defaultManager]
-            attributesOfItemAtPath:[home stringByAppendingPathComponent:rel] error:nil];
-        [fileList appendFormat:@"  %@ (%llu bytes)\n", rel, [attr fileSize]];
-    }
-    [fileList writeToFile:[dir stringByAppendingPathComponent:@"container_files.txt"]
-               atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-    [rpt appendFormat:@"\nTotal: %d files dumped\n", dumped];
+    [rpt appendFormat:@"\nTotal: %d files\n", dumped];
     [rpt writeToFile:[dir stringByAppendingPathComponent:@"dump_report.txt"]
           atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSLog(@"[SS] dump done: %d files", dumped);
@@ -452,8 +407,9 @@ static void performDump(void) {
 // ================================================================
 
 static void onSolveTapped(void) {
-    NSLog(@"[SS] solve tapped");
-    showToast(solveViaDB());
+    NSLog(@"[SS] solve tapped – arming");
+    gSolvePending = YES;
+    showToast(@"⚡ Armed!\n1. Press home button\n2. Force-close the app\n3. Reopen");
 }
 
 static void onDumpTapped(void) {
@@ -507,11 +463,9 @@ static void addButton(UIWindow *win) {
     [gBtn setTitle:@"⚡" forState:UIControlStateNormal];
     gBtn.titleLabel.font = [UIFont systemFontOfSize:22];
     [gBtn addTarget:gBtn action:@selector(ssTap) forControlEvents:UIControlEventTouchUpInside];
-    UIPanGestureRecognizer *pan =
-        [[UIPanGestureRecognizer alloc] initWithTarget:gBtn action:@selector(ssPan:)];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:gBtn action:@selector(ssPan:)];
     [gBtn addGestureRecognizer:pan];
-    UILongPressGestureRecognizer *lp =
-        [[UILongPressGestureRecognizer alloc] initWithTarget:gBtn action:@selector(ssDump:)];
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:gBtn action:@selector(ssDump:)];
     lp.minimumPressDuration = 1.5;
     [gBtn addGestureRecognizer:lp];
     [win addSubview:gBtn];
@@ -519,7 +473,35 @@ static void addButton(UIWindow *win) {
 }
 
 // ================================================================
-#pragma mark - Hook
+#pragma mark - Hook: patch AFTER the game saves on background
+// ================================================================
+
+%hook UnityAppController
+
+- (void)applicationDidEnterBackground:(UIApplication *)app {
+    %orig;  // Unity's OnApplicationPause fires inside here — game saves state
+
+    if (!gSolvePending) return;
+
+    // Give any async DB writes up to 0.5 s to finish
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+        dispatch_get_global_queue(0, 0), ^{
+
+        if (!gSolvePending) return;
+        gSolvePending = NO;
+
+        gDBPath = nil; // force re-discover in case path changed
+        NSString *r = solveViaDB();
+        NSLog(@"[SS] background solve: %@", r);
+        // Can't show a toast here (app is backgrounded) — log is enough.
+        // When the user reopens, the board will be solved.
+    });
+}
+
+%end
+
+// ================================================================
+#pragma mark - Hook: UIWindow (add button)
 // ================================================================
 
 %hook UIWindow
