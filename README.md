@@ -1,44 +1,36 @@
 # SudokuSolver
 
-Auto-solve tweak for **Easybrain Sudoku** (`com.easybrain.sudoku`) on iOS.
+Tweak for **Easybrain Sudoku** (`com.easybrain.sudoku`).
 
-## How it works
+## Usage
 
-A floating ⚡ button appears in-game. Tap it to auto-fill every empty cell with the correct answer.
+| Action | Result |
+|--------|--------|
+| Tap ⚡ | Solve the current puzzle (patches the save DB) |
+| Long-press ⚡ | Dump decrypted binaries + metadata → `Documents/SudokuSolver/` |
+| Drag ⚡ | Reposition the button |
 
-### Primary: IL2CPP runtime solve (instant)
-- Resolves Unity's `il2cpp_*` API exports via `dlsym` at runtime
-- Hooks `il2cpp_runtime_invoke` to capture the active `BoardModelCells` instance
-- Calls `GetCellAnswer(i)` → `SetCell(i, answer)` for every mutable cell
-- Works instantly without reloading
+After tapping ⚡, **force-close and reopen** the app — the game reads save data at launch, so a full kill+relaunch is required to see the board filled in.
 
-### Fallback: SQLite DB patch (requires reload)
-- Hooks `sqlite3_open` to auto-detect the game database
-- Reads the `solution` column from the `SudokuGame` table
-- Writes it into the `cells` column
-- You need to back out and re-enter the level for it to take effect
+## How it works (v4)
+
+The game stores puzzle state in `Library/Application Support/save/database.sqlite` in a table called `saved_progress`. Each row has two binary blobs:
+
+- **`level`** — puzzle definition. Contains two packed 81×uint32 LE grids: the **solution** (values 1–9, no zeros) and the **original puzzle** (zeros = empty cells).
+- **`data`** — current game state. Contains a packed 81×uint32 LE grid of the player's current cell values.
+
+Tapping ⚡ reads the most recent `saved_progress` row, byte-scans the `level` blob for the solution grid, overwrites the matching grid in the `data` blob, and writes it back.
+
+## Requirements
+
+- Jailbroken iOS 15+ (rootless or rootful)
+- Substrate / Substitute / libhooker
 
 ## Building
 
-### GitHub Actions
-Push to `main` and the workflow builds both rootless and rootful `.deb` packages automatically.
-
-### Local
-```
-export THEOS=~/theos
-make package
+```bash
+make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless  # rootless
+make clean && make package FINALPACKAGE=1                   # rootful
 ```
 
-## Install
-- **Rootless jailbreak (Dopamine etc):** use the rootless `.deb`
-- **Rootful jailbreak (unc0ver etc):** use the rootful `.deb`
-- **TrollStore / Sideload:** inject the dylib with your preferred method
-
-## Target app info
-| | |
-|---|---|
-| App | Sudoku.com by Easybrain |
-| Bundle ID | `com.easybrain.sudoku` |
-| Engine | Unity IL2CPP arm64 |
-| Metadata version | 31 |
-| Key class | `BoardModelCells` (Sudoku.Game.Mechanics.Base) |
+Or push to `main` and grab the `.deb` from the GitHub Actions artifact.

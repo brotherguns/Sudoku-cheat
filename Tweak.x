@@ -1,10 +1,14 @@
 /*
- * SudokuSolver v3 — Easybrain Sudoku (com.easybrain.sudoku)
+ * SudokuSolver v4 — Easybrain Sudoku (com.easybrain.sudoku)
  *
- * Safe dylib injection. Only hooks UIWindow for the floating button.
+ * Fixed: targets real DB schema (saved_progress table, not SudokuGame).
+ * The game stores puzzle/solution data as binary blobs:
+ *   level blob : solution — 81×uint32 LE, values 1-9, no zeros
+ *   level blob : puzzle   — 81×uint32 LE, values 0-9, zeros = empty
+ *   data  blob : cells    — 81×uint32 LE, current cell state (what we overwrite)
  *
- * Tap ⚡ = solve via SQLite (read solution column, write to cells)
- * Long-press ⚡ = dump decrypted binaries + metadata to Documents/SudokuSolver/
+ * Tap  ⚡ = solve the active game via blob patch
+ * Long ⚡ = dump decrypted binaries + metadata to Documents/SudokuSolver/
  */
 
 #import <UIKit/UIKit.h>
@@ -74,15 +78,15 @@ static void showToast(NSString *msg) {
 #pragma mark - Database discovery
 // ================================================================
 
-// Check if a file is a SQLite database with SudokuGame table
-static BOOL hasSudokuTable(NSString *path) {
+// Check for the real Easybrain save-state table.
+static BOOL hasGameTable(NSString *path) {
     sqlite3 *db;
     if (sqlite3_open_v2([path UTF8String], &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
         return NO;
     BOOL found = NO;
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(db,
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='SudokuGame'",
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='saved_progress'",
             -1, &st, NULL) == SQLITE_OK) {
         found = (sqlite3_step(st) == SQLITE_ROW);
         sqlite3_finalize(st);
@@ -91,7 +95,6 @@ static BOOL hasSudokuTable(NSString *path) {
     return found;
 }
 
-// Check if first bytes are SQLite magic
 static BOOL isSQLiteFile(NSString *path) {
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
     if (!fh) return NO;
@@ -107,17 +110,14 @@ static NSString *findDB(void) {
     NSString *home = NSHomeDirectory();
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // Recursively search the entire app container for SQLite files
     NSDirectoryEnumerator *en = [fm enumeratorAtPath:home];
     NSString *rel;
     NSMutableArray *candidates = [NSMutableArray array];
 
     while ((rel = [en nextObject])) {
-        // Skip the .app bundle (read-only, no user data)
         if ([rel hasPrefix:@"Sudoku.app"] || [rel containsString:@".app/"]) {
             [en skipDescendants]; continue;
         }
-        // Skip Frameworks and PlugIns dirs
         if ([rel containsString:@"Frameworks/"] || [rel containsString:@"PlugIns/"]) {
             [en skipDescendants]; continue;
         }
@@ -127,20 +127,16 @@ static NSString *findDB(void) {
         [fm fileExistsAtPath:full isDirectory:&isDir];
         if (isDir) continue;
 
-        // Check known extensions first
         NSString *ext = [rel pathExtension].lowercaseString;
         if ([ext isEqualToString:@"sqlite"] || [ext isEqualToString:@"sqlite3"] || [ext isEqualToString:@"db"]) {
-            [candidates insertObject:full atIndex:0]; // priority
+            [candidates insertObject:full atIndex:0];
             continue;
         }
 
-        // Also check files with no extension or unusual names — if they're SQLite
         NSDictionary *attr = [fm attributesOfItemAtPath:full error:nil];
         unsigned long long sz = [attr fileSize];
-        if (sz > 4096 && sz < 500*1024*1024) { // reasonable DB size
-            if (isSQLiteFile(full)) {
-                [candidates addObject:full];
-            }
+        if (sz > 4096 && sz < 500*1024*1024) {
+            if (isSQLiteFile(full)) [candidates addObject:full];
         }
     }
 
@@ -148,68 +144,129 @@ static NSString *findDB(void) {
 
     for (NSString *c in candidates) {
         NSLog(@"[SS] checking: %@", [c stringByReplacingOccurrencesOfString:home withString:@"~"]);
-        if (hasSudokuTable(c)) {
+        if (hasGameTable(c)) {
             gDBPath = [c copy];
-            NSLog(@"[SS] ✓ found game db: %@", gDBPath);
+            NSLog(@"[SS] found game db: %@", gDBPath);
             return gDBPath;
         }
     }
 
-    NSLog(@"[SS] no SudokuGame table in any of %lu files", (unsigned long)candidates.count);
+    NSLog(@"[SS] no saved_progress table found in %lu candidates", (unsigned long)candidates.count);
     return nil;
 }
 
 // ================================================================
-#pragma mark - Solve via DB
+#pragma mark - Blob grid scanner
+// ================================================================
+
+/*
+ * scanForGrid — byte-by-byte scan for 81 consecutive uint32 LE values
+ * all within [0..9]. If requireNonZero, also rejects zeros (finds solution).
+ * Returns byte offset, or -1 if not found.
+ *
+ * Blobs are typically ~800-1000 bytes, so this is fast.
+ */
+static NSInteger scanForGrid(const uint8_t *bytes, NSInteger len, BOOL requireNonZero) {
+    NSInteger limit = len - 81 * 4;
+    for (NSInteger off = 0; off <= limit; off++) {
+        BOOL valid = YES;
+        for (int i = 0; i < 81; i++) {
+            uint32_t v;
+            memcpy(&v, bytes + off + i * 4, 4);
+            // arm64 is LE, so no swap needed
+            if (v > 9 || (requireNonZero && v == 0)) { valid = NO; break; }
+        }
+        if (valid) return off;
+    }
+    return -1;
+}
+
+// ================================================================
+#pragma mark - Solve via DB (blob patch)
 // ================================================================
 
 static NSString *solveViaDB(void) {
     NSString *dbPath = findDB();
-    if (!dbPath) return @"No game database found. Start a game first.";
+    if (!dbPath) return @"No game database found.\nStart a puzzle first.";
 
     sqlite3 *db;
     if (sqlite3_open([dbPath UTF8String], &db) != SQLITE_OK)
-        return @"Failed to open database";
+        return @"Failed to open database.";
 
     NSString *result = nil;
     sqlite3_stmt *st;
 
-    if (sqlite3_prepare_v2(db,
-            "SELECT solution, cells, state FROM SudokuGame "
-            "ORDER BY lastPlayed DESC LIMIT 1",
-            -1, &st, NULL) == SQLITE_OK) {
+    const char *query =
+        "SELECT sp.rowid, sp.data, sp.level "
+        "FROM saved_progress sp "
+        "ORDER BY sp.time_unix DESC LIMIT 1";
 
+    if (sqlite3_prepare_v2(db, query, -1, &st, NULL) == SQLITE_OK) {
         if (sqlite3_step(st) == SQLITE_ROW) {
-            const char *sol   = (const char *)sqlite3_column_text(st, 0);
-            const char *cells = (const char *)sqlite3_column_text(st, 1);
-            const char *state = (const char *)sqlite3_column_text(st, 2);
+            sqlite3_int64 rowid  = sqlite3_column_int64(st, 0);
+            const void *rawData  = sqlite3_column_blob(st, 1);
+            int dataLen          = sqlite3_column_bytes(st, 1);
+            const void *rawLevel = sqlite3_column_blob(st, 2);
+            int levelLen         = sqlite3_column_bytes(st, 2);
 
-            NSLog(@"[SS] state=%s sol=%lu cells=%lu",
-                  state ?: "(nil)", sol ? strlen(sol) : 0, cells ? strlen(cells) : 0);
+            NSLog(@"[SS] rowid=%lld data=%d bytes level=%d bytes", rowid, dataLen, levelLen);
 
-            if (state && strcmp(state, "COMPLETED") == 0) {
-                result = @"Game already completed";
-            } else if (!sol || strlen(sol) == 0) {
-                result = @"No solution in DB (try a different game mode)";
-            } else if (cells && strcmp(cells, sol) == 0) {
-                result = @"Already solved!";
+            if (!rawData || !rawLevel || dataLen < 81*4 || levelLen < 81*4) {
+                result = @"Blob too small — unexpected format.";
             } else {
-                sqlite3_stmt *upd;
-                if (sqlite3_prepare_v2(db,
-                        "UPDATE SudokuGame SET cells = ? "
-                        "WHERE rowid = (SELECT rowid FROM SudokuGame "
-                        "ORDER BY lastPlayed DESC LIMIT 1)",
-                        -1, &upd, NULL) == SQLITE_OK) {
-                    sqlite3_bind_text(upd, 1, sol, -1, SQLITE_TRANSIENT);
-                    if (sqlite3_step(upd) == SQLITE_DONE)
-                        result = @"Solved! Restart the level to see.";
-                    else
-                        result = [NSString stringWithFormat:@"Write failed: %s", sqlite3_errmsg(db)];
-                    sqlite3_finalize(upd);
+                const uint8_t *dataBytes  = (const uint8_t *)rawData;
+                const uint8_t *levelBytes = (const uint8_t *)rawLevel;
+
+                // 1. Find the solution in the level blob (81 values, all 1-9, no zeros)
+                NSInteger solOffset = scanForGrid(levelBytes, levelLen, YES);
+                if (solOffset < 0) {
+                    result = @"Solution not found in level data.\n(Try a different game mode.)";
+                } else {
+                    uint32_t solution[81];
+                    for (int i = 0; i < 81; i++)
+                        memcpy(&solution[i], levelBytes + solOffset + i * 4, 4);
+
+                    NSLog(@"[SS] solution at level+%ld: %u %u %u ...",
+                          (long)solOffset, solution[0], solution[1], solution[2]);
+
+                    // 2. Find the current cell array in the data blob (values 0-9, zeros OK)
+                    NSInteger cellOffset = scanForGrid(dataBytes, dataLen, NO);
+                    if (cellOffset < 0) {
+                        result = @"Cell array not found in save data.\n(Try re-entering the puzzle.)";
+                    } else {
+                        NSLog(@"[SS] cells at data+%ld", (long)cellOffset);
+
+                        // 3. Patch: overwrite cell array with solution
+                        NSMutableData *patchedData =
+                            [NSMutableData dataWithBytes:rawData length:dataLen];
+                        uint8_t *out = (uint8_t *)patchedData.mutableBytes;
+
+                        for (int i = 0; i < 81; i++)
+                            memcpy(out + cellOffset + i * 4, &solution[i], 4);
+
+                        // 4. Write patched blob back
+                        sqlite3_stmt *upd;
+                        if (sqlite3_prepare_v2(db,
+                                "UPDATE saved_progress SET data = ? WHERE rowid = ?",
+                                -1, &upd, NULL) == SQLITE_OK) {
+                            sqlite3_bind_blob(upd, 1,
+                                patchedData.bytes, (int)patchedData.length, SQLITE_TRANSIENT);
+                            sqlite3_bind_int64(upd, 2, rowid);
+                            if (sqlite3_step(upd) == SQLITE_DONE)
+                                result = @"Solved!\nForce-close & reopen to see it.";
+                            else
+                                result = [NSString stringWithFormat:@"Write failed: %s",
+                                          sqlite3_errmsg(db)];
+                            sqlite3_finalize(upd);
+                        } else {
+                            result = [NSString stringWithFormat:@"Prepare failed: %s",
+                                      sqlite3_errmsg(db)];
+                        }
+                    }
                 }
             }
         } else {
-            result = @"No games in database";
+            result = @"No saved games found.\nStart a puzzle first.";
         }
         sqlite3_finalize(st);
     } else {
@@ -235,7 +292,6 @@ static BOOL dumpImage(const struct mach_header_64 *hdr, intptr_t slide, NSString
     @try {
         if (!hdr || hdr->magic != MH_MAGIC_64) return NO;
 
-        // Calculate total file size from segments
         const uint8_t *ptr = (const uint8_t *)hdr + sizeof(struct mach_header_64);
         uint64_t fileSize = 0;
 
@@ -249,20 +305,18 @@ static BOOL dumpImage(const struct mach_header_64 *hdr, intptr_t slide, NSString
             ptr += lc->cmdsize;
         }
 
-        if (fileSize == 0 || fileSize > 500*1024*1024) return NO; // sanity
+        if (fileSize == 0 || fileSize > 500*1024*1024) return NO;
 
         NSMutableData *data = [NSMutableData dataWithLength:(NSUInteger)fileSize];
         if (!data) return NO;
         uint8_t *buf = (uint8_t *)data.mutableBytes;
 
-        // Copy each segment from live memory into its file offset position
         ptr = (const uint8_t *)hdr + sizeof(struct mach_header_64);
         for (uint32_t i = 0; i < hdr->ncmds; i++) {
             const struct load_command *lc = (const struct load_command *)ptr;
             if (lc->cmd == LC_SEGMENT_64) {
                 const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
                 if (seg->filesize > 0 && seg->fileoff + seg->filesize <= fileSize) {
-                    // seg->vmaddr + slide = actual address in memory
                     const void *src = (const void *)(seg->vmaddr + slide);
                     memcpy(buf + seg->fileoff, src, (size_t)seg->filesize);
                 }
@@ -270,7 +324,6 @@ static BOOL dumpImage(const struct mach_header_64 *hdr, intptr_t slide, NSString
             ptr += lc->cmdsize;
         }
 
-        // Clear cryptid in the output buffer
         ptr = buf + sizeof(struct mach_header_64);
         for (uint32_t i = 0; i < hdr->ncmds; i++) {
             struct load_command *lc = (struct load_command *)ptr;
@@ -305,7 +358,6 @@ static void performDump(void) {
         NSString *path = [NSString stringWithUTF8String:name];
         NSString *imgName = [path lastPathComponent];
 
-        // Only dump app binaries (main exe + anything in app bundle)
         BOOL shouldDump = (i == 0) || [path containsString:appPath];
         if (!shouldDump) continue;
 
@@ -314,17 +366,13 @@ static void performDump(void) {
         if (hdr->magic == MH_MAGIC_64) {
             NSString *out = [dir stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"%@.decrypted", imgName]];
-
-            // Remove old dump if it exists
             [[NSFileManager defaultManager] removeItemAtPath:out error:nil];
-
             BOOL ok = dumpImage((const struct mach_header_64 *)hdr, slide, out);
             [rpt appendFormat:@"  → %@\n", ok ? @"OK" : @"FAIL"];
             if (ok) dumped++;
         }
     }
 
-    // Copy global-metadata.dat
     NSArray *metaPaths = @[
         [appPath stringByAppendingPathComponent:@"Data/Managed/Metadata/global-metadata.dat"],
         [appPath stringByAppendingPathComponent:@"Frameworks/UnityFramework.framework/Data/Managed/Metadata/global-metadata.dat"],
@@ -340,7 +388,6 @@ static void performDump(void) {
         }
     }
 
-    // Copy the game DB if found
     NSString *dbPath = findDB();
     if (dbPath) {
         NSString *dst = [dir stringByAppendingPathComponent:[dbPath lastPathComponent]];
@@ -350,7 +397,6 @@ static void performDump(void) {
         dumped++;
     }
 
-    // Also dump a list of ALL files in the app container (helps debug DB issues)
     NSMutableString *fileList = [NSMutableString stringWithString:@"App container files:\n"];
     NSString *home = NSHomeDirectory();
     NSDirectoryEnumerator *en = [[NSFileManager defaultManager] enumeratorAtPath:home];
@@ -382,7 +428,7 @@ static void onSolveTapped(void) {
 }
 
 static void onDumpTapped(void) {
-    showToast(@"Dumping...");
+    showToast(@"Dumping…");
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         performDump();
         NSString *dir = dumpDir();
